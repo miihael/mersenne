@@ -39,7 +39,6 @@ enum instance_state {
     IS_P1_READY_NO_VALUE,
     IS_P1_READY_WITH_VALUE,
     IS_P2_PENDING,
-    IS_CLOSED,
     IS_DELIVERED,
     IS_MAX
 };
@@ -55,6 +54,8 @@ struct pro_instance {
 	} p1;
 	struct {
 		struct buffer *v;
+		struct buffer *lv;
+		struct bm_mask *learns;
 	} p2;
 	int client_value;
 	ev_timer timer;
@@ -70,7 +71,7 @@ enum instance_event_type {
 	IE_NV,
 	IE_A,
 	IE_E,
-	IE_C,
+	IE_L,
 	IE_D,
 };
 
@@ -81,6 +82,13 @@ struct ie_base {
 struct ie_p {
 	struct me_peer *from;
 	struct me_paxos_promise_data *data;
+	struct ie_base b;
+};
+
+struct ie_l {
+	struct me_peer *from;
+	uint64_t i;
+	struct buffer *v;
 	struct ie_base b;
 };
 
@@ -101,7 +109,6 @@ void do_is_p1_pending(ME_P_ struct pro_instance *instance, struct ie_base *base)
 void do_is_p1_ready_no_value(ME_P_ struct pro_instance *instance, struct ie_base *base);
 void do_is_p1_ready_with_value(ME_P_ struct pro_instance *instance, struct ie_base *base);
 void do_is_p2_pending(ME_P_ struct pro_instance *instance, struct ie_base *base);
-void do_is_closed(ME_P_ struct pro_instance *instance, struct ie_base *base);
 void do_is_delivered(ME_P_ struct pro_instance *instance, struct ie_base *base);
 
 #endif

@@ -38,13 +38,14 @@
 #include <mersenne/sharedmem.h>
 #include <mersenne/log.h>
 
+//#define WINDOW_DUMP
+
 static is_func_t * const state_table[IS_MAX] = {
 	do_is_empty,
 	do_is_p1_pending,
 	do_is_p1_ready_no_value,
 	do_is_p1_ready_with_value,
 	do_is_p2_pending,
-	do_is_closed,
 	do_is_delivered,
 };
 
@@ -84,6 +85,7 @@ static int pending_append(ME_P_ struct buffer *from)
 	pv->v = sm_in_use(from);
 	DL_APPEND(mctx->pxs.pro.pending, pv);
 	mctx->pxs.pro.pending_size++;
+	log(LL_DEBUG, "Appended, pending size: %d\n", mctx->pxs.pro.pending_size);
 	return 0;
 }
 
@@ -92,10 +94,12 @@ static int pending_shift(ME_P_ struct buffer **pptr)
 	struct pending_value *pv = mctx->pxs.pro.pending;
 	if(NULL == pv)
 		return 0;
+	assert(mctx->pxs.pro.pending_size > 0);
 	DL_DELETE(mctx->pxs.pro.pending, pv);
 	*pptr = pv->v;
 	mctx->pxs.pro.pending_size--;
 	fbr_free(&mctx->fbr, pv);
+	log(LL_DEBUG, "Shifted, pending size: %d\n", mctx->pxs.pro.pending_size);
 	return 1;
 }
 
@@ -105,6 +109,8 @@ static void pending_unshift(ME_P_ struct buffer *from)
 	pv = fbr_calloc(&mctx->fbr, 1, sizeof(struct pending_value));
 	pv->v = sm_in_use(from);
 	DL_PREPEND(mctx->pxs.pro.pending, pv);
+	mctx->pxs.pro.pending_size++;
+	log(LL_DEBUG, "Unshifted, pending size: %d\n", mctx->pxs.pro.pending_size);
 }
 
 #ifdef WINDOW_DUMP
@@ -118,9 +124,6 @@ static void print_window(ME_P)
 	for(j = 0; j < PRO_INSTANCE_WINDOW; j++) {
 		instance = mctx->pxs.pro.instances +j;
 		switch(instance->state) {
-			case IS_CLOSED:
-				*ptr++ = 'C';
-				break;
 			case IS_DELIVERED:
 				*ptr++ = 'D';
 				break;
@@ -179,6 +182,7 @@ static void reclaim_instance(ME_P_ struct pro_instance *instance)
 {
 	struct ie_base base;
 	struct bm_mask *mask = instance->p1.acks;
+	struct bm_mask *mask2 = instance->p2.learns;
 	base.type = IE_I;
 	ev_timer timer = instance->timer;
 	if(instance->p1.v)
@@ -188,6 +192,8 @@ static void reclaim_instance(ME_P_ struct pro_instance *instance)
 	memset(instance, 0x00, sizeof(struct pro_instance));
 	bm_init(mask, peer_count(ME_A));
 	instance->p1.acks = mask;
+	bm_init(mask2, peer_count(ME_A));
+	instance->p2.learns = mask2;
 	instance->timer = timer;
 	instance->iid = mctx->pxs.pro.max_iid++;
 	run_instance(ME_A_ instance, &base);
@@ -261,6 +267,7 @@ void do_is_p1_pending(ME_P_ struct pro_instance *instance, struct ie_base *base)
 			instance->b = encode_ballot(ME_A_ 1);
 			instance->p1.v = NULL;
 			instance->p2.v = NULL;
+			instance->p2.lv = NULL;
 			instance->p1.vb = 0;
 			instance->client_value = 0;
 			send_prepare(ME_A_ instance);
@@ -381,11 +388,39 @@ void do_is_p1_ready_with_value(ME_P_ struct pro_instance *instance, struct ie_ba
 
 void do_is_p2_pending(ME_P_ struct pro_instance *instance, struct ie_base *base)
 {
+	struct ie_l *l;
+	struct ie_d d;
+	int num;
 	switch(base->type) {
 		case IE_E:
 			send_accept(ME_A_ instance);
 			instance->timer.repeat = TO2;
 			ev_timer_again(mctx->loop, &instance->timer);
+			break;
+		case IE_L:
+			l = container_of(base, struct ie_l, b);
+			log(LL_DEBUG, "[PROPOSER] Processing learn for instance %lu "
+					"from peer #%d\n", l->i,
+					l->from->index);
+			assert(l->v);
+			if(NULL == instance->p2.lv) {
+				instance->p2.lv = sm_in_use(l->v);
+				log(LL_DEBUG, "[PROPOSER] Initialized learnt "
+						"value for instance %lu\n",
+						l->i);
+			} else {
+				assert(0 == buf_cmp(instance->p2.lv, l->v));
+			}
+			bm_set_bit(instance->p2.learns, l->from->index, 1);
+			num = bm_hweight(instance->p2.learns);
+			if(pxs_is_acc_majority(ME_A_ num)) {
+				ev_timer_stop(mctx->loop, &instance->timer);
+				d.b.type = IE_D;
+				d.buffer = instance->p2.lv;
+				instance->p2.lv = NULL;
+				switch_instance(ME_A_ instance, IS_DELIVERED,
+						&d.b);
+			}
 			break;
 		case IE_TO:
 			log(LL_DEBUG, "[PROPOSER] Phase 2 timeout for instance #%lu at ballot #%lu\n", instance->iid, instance->b);
@@ -402,11 +437,6 @@ void do_is_p2_pending(ME_P_ struct pro_instance *instance, struct ie_base *base)
 	}
 }
 
-void do_is_closed(ME_P_ struct pro_instance *instance, struct ie_base *base)
-{
-	//TODO: Do we really need this?
-}
-
 void do_is_delivered(ME_P_ struct pro_instance *instance, struct ie_base *base)
 {
 	struct ie_d *d;
@@ -414,12 +444,11 @@ void do_is_delivered(ME_P_ struct pro_instance *instance, struct ie_base *base)
 		case IE_D:
 			d = container_of(base, struct ie_d, b);
 			if(instance->client_value) {
-				if(v2_eql_to(instance, d->buffer)) {
-					//TODO: Client value delivered,
-					//TODO: inform it about this
-				} else
+				assert(d->buffer->size1 > 0);
+				if(!v2_eql_to(instance, d->buffer))
 					pending_unshift(ME_A_ instance->p2.v);
 			}
+			sm_free(d->buffer);
 			ev_timer_stop(mctx->loop, &instance->timer);
 			adjust_window(ME_A);
 			break;
@@ -455,8 +484,38 @@ static void do_promise(ME_P_ struct me_paxos_message *pmsg, struct me_peer
 	assert(instance->iid == data->i);
 	if(IS_P1_PENDING != instance->state)
 		return;
-	if(instance->b == data->b && IS_P1_PENDING == instance->state)
+	if(instance->b == data->b)
 		run_instance(ME_A_ instance, &p.b);
+}
+
+static void do_learn(ME_P_ struct me_paxos_message *pmsg, struct me_peer
+		*from, struct buffer *buf)
+{
+	struct pro_instance *instance;
+	struct me_paxos_learn_data *data;
+	struct ie_l l;
+	data = &pmsg->data.me_paxos_msg_data_u.learn;
+	log(LL_DEBUG, "[PROPOSER] Got learn for instance %lu "
+			"from peer #%d\n", data->i, from->index);
+	if(data->i < mctx->pxs.pro.lowest_non_closed) {
+		log(LL_DEBUG, "[PROPOSER] Learn discarded as %lu < %lu "
+				"(lowest non closed)\n",
+				data->i,
+				mctx->pxs.pro.lowest_non_closed);
+		return;
+	}
+	l.b.type = IE_L;
+	l.from = from;
+	l.i = data->i;
+	l.v = buf;
+	assert(l.v->size1 > 0);
+	assert(0 == data->v->size1);
+	instance = mctx->pxs.pro.instances + (data->i % PRO_INSTANCE_WINDOW);
+	assert(instance->iid == data->i);
+	if(IS_P2_PENDING != instance->state)
+		return;
+	if(instance->b == data->b)
+		run_instance(ME_A_ instance, &l.b);
 }
 
 static void instance_timeout_cb (EV_P_ ev_timer *w, int revents)
@@ -466,6 +525,7 @@ static void instance_timeout_cb (EV_P_ ev_timer *w, int revents)
 	struct ie_base base;
 	instance = container_of(w, struct pro_instance, timer);
 	base.type = IE_TO;
+	fprintf(stderr, "Timeout for instance #%lu!\n", instance->iid);
 	run_instance(ME_A_ instance, &base);
 }
 
@@ -474,8 +534,11 @@ static void init_instance(ME_P_ struct pro_instance *instance)
 	int nbits = peer_count(ME_A);
 	instance->p1.acks = fbr_alloc(&mctx->fbr, bm_size(nbits));
 	bm_init(instance->p1.acks, nbits);
+	instance->p2.learns = fbr_alloc(&mctx->fbr, bm_size(nbits));
+	bm_init(instance->p2.learns, nbits);
 	instance->p1.v = NULL;
 	instance->p2.v = NULL;
+	instance->p2.lv = NULL;
 	ev_timer_init(&instance->timer, instance_timeout_cb, 0., 0.);
 	instance->timer.data = ME_A;
 }
@@ -547,16 +610,19 @@ static void do_client_value(ME_P_ struct buffer *buf)
 	pending_append(ME_A_ buf);
 }
 
-static void do_message(ME_P_ struct me_message *msg, struct me_peer *from)
+static void do_message(ME_P_ struct me_message *msg, struct me_peer *from, struct buffer *buf)
 {
 	struct me_paxos_message *pmsg;
-	struct buffer *buf;
 
 	pmsg = &msg->me_message_u.paxos_message;
 
 	switch(pmsg->data.type) {
 		case ME_PAXOS_PROMISE:
 			do_promise(ME_A_ pmsg, from);
+			break;
+		case ME_PAXOS_LEARN:
+			assert(buf);
+			do_learn(ME_A_ pmsg, from, buf);
 			break;
 		case ME_PAXOS_REJECT:
 			do_reject(ME_A_ pmsg, from);
@@ -566,21 +632,13 @@ static void do_message(ME_P_ struct me_message *msg, struct me_peer *from)
 			do_client_value(ME_A_ buf);
 			sm_free(buf);
 			break;
+		case ME_PAXOS_LAST_ACCEPTED:
+			break;
 		default:
 			errx(EXIT_FAILURE, "invalid paxos message type for "
 					"proposer: %s",
 					strval_me_paxos_message_type(pmsg->data.type));
 	}
-}
-
-static void do_delivered_value(ME_P_ uint64_t iid, struct buffer *buffer)
-{
-	struct ie_d d;
-	struct pro_instance *instance;
-	d.b.type = IE_D;
-	d.buffer = buffer;
-	instance = mctx->pxs.pro.instances + (iid % PRO_INSTANCE_WINDOW);
-	switch_instance(ME_A_ instance, IS_DELIVERED, &d.b);
 }
 
 void pro_fiber(struct fbr_context *fiber_context)
@@ -589,17 +647,13 @@ void pro_fiber(struct fbr_context *fiber_context)
 	struct me_message *msg;
 	struct me_peer *from;
 	struct fbr_call_info *info = NULL;
-	struct fbr_fiber *learner;
 	struct buffer *buf;
-	uint64_t iid;
 
 	mctx = container_of(fiber_context, struct me_context, fbr);
 	fbr_next_call_info(&mctx->fbr, NULL);
 
 	proposer_init(ME_A);
-
-	learner = fbr_create(&mctx->fbr, "proposer/learner", lea_fiber, 0);
-	fbr_call(&mctx->fbr, learner, 1, fbr_arg_i(0));
+	fbr_subscribe(&mctx->fbr, FMT_LEARNER);
 
 start:
 	fbr_yield(&mctx->fbr);
@@ -607,11 +661,16 @@ start:
 
 		switch(info->argv[0].i) {
 			case FAT_ME_MESSAGE:
-				fbr_assert(&mctx->fbr, 3 == info->argc);
+				fbr_assert(&mctx->fbr, 3 == info->argc
+						|| 4 == info->argc);
 				msg = info->argv[1].v;
 				from = info->argv[2].v;
+				if(4 == info->argc)
+					buf = info->argv[3].v;
+				else
+					buf = NULL;
 
-				do_message(ME_A_ msg, from);
+				do_message(ME_A_ msg, from, buf);
 				sm_free(msg);
 				break;
 			case FAT_PXS_CLIENT_VALUE:
@@ -621,13 +680,6 @@ start:
 				do_client_value(ME_A_ buf);
 				sm_free(buf);
 				break;
-			case FAT_PXS_DELIVERED_VALUE:
-				fbr_assert(&mctx->fbr, 3 == info->argc);
-				iid = info->argv[1].i;
-				buf = info->argv[2].v;
-				do_delivered_value(ME_A_ iid, buf);
-				sm_free(buf);
-				break;
 			case FAT_QUIT:
 				goto fiber_exit;
 		}
@@ -635,7 +687,6 @@ start:
 	goto start;
 fiber_exit:
 	proposer_shutdown(ME_A);
-	fbr_reclaim(&mctx->fbr, learner);
 }
 
 static void send_proxy_value(ME_P_ struct buffer *buf)
@@ -663,7 +714,8 @@ start:
 
 		switch(info->argv[0].i) {
 			case FAT_ME_MESSAGE:
-				fbr_assert(&mctx->fbr, 3 == info->argc);
+				fbr_assert(&mctx->fbr, 3 == info->argc
+						|| 4 == info->argc);
 				sm_free(info->argv[1].v);
 				break;
 			case FAT_PXS_CLIENT_VALUE:
