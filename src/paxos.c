@@ -59,6 +59,7 @@ void pxs_do_message(ME_P_ struct me_message *msg, struct me_peer *from)
 	struct fbr_buffer *fb;
 	struct fiber_tailq_i *item;
 	struct pro_msg_me_message *pro_msg;
+	struct acc_msg *acc_msg;
 
 	pmsg = &msg->me_message_u.paxos_message;
 
@@ -66,17 +67,18 @@ void pxs_do_message(ME_P_ struct me_message *msg, struct me_peer *from)
 	case ME_PAXOS_PREPARE:
 	case ME_PAXOS_ACCEPT:
 	case ME_PAXOS_RETRANSMIT:
-		if(!mctx->me->pxs.is_acceptor)
+		if (!mctx->me->pxs.is_acceptor)
 			break;
 		fb = fbr_get_user_data(&mctx->fbr, mctx->fiber_acceptor);
 		if (NULL == fb)
 			/* Acceptor is not yet ready to handle anything */
 			break;
-		buffer_ensure_writable(ME_A_ fb, sizeof(struct msg_info));
-		info = fbr_buffer_alloc_prepare(&mctx->fbr, fb,
-				sizeof(struct msg_info));
-		info->msg = sm_in_use(msg);
-		info->from = from;
+		buffer_ensure_writable(ME_A_ fb, sizeof(struct acc_msg));
+		acc_msg = fbr_buffer_alloc_prepare(&mctx->fbr, fb,
+				sizeof(struct acc_msg));
+		acc_msg->type = ACC_MT_MSG_INFO;
+		acc_msg->msg_info.msg = sm_in_use(msg);
+		acc_msg->msg_info.from = from;
 		fbr_buffer_alloc_commit(&mctx->fbr, fb);
 		break;
 

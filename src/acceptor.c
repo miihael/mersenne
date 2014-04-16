@@ -217,20 +217,20 @@ static void repeater_fiber(struct fbr_context *fiber_context, void *_arg)
 	}
 }
 
-static void do_delivered_value(ME_P_ uint64_t iid, struct buffer *buffer)
+static void do_delivered_value(ME_P_ struct lea_instance_info *info)
 {
 	struct acc_instance_record *r = NULL;
 
-	if (0 == acs_find_record(ME_A_ &r, iid, ACS_FM_CREATE)) {
-		r->iid = iid;
+	if (0 == acs_find_record(ME_A_ &r, info->iid, ACS_FM_CREATE)) {
+		r->iid = info->iid;
 		r->b = 0ULL;
-		r->v = sm_in_use(buffer);
+		r->v = sm_in_use(info->buffer);
 		r->vb = 0ULL;
 		acs_store_record(ME_A_ r);
 	} else {
-		if (NULL == r->v || 0 != buf_cmp(r->v, buffer)) {
+		if (NULL == r->v || 0 != buf_cmp(r->v, info->buffer)) {
 			sm_free(r->v);
-			r->v = sm_in_use(buffer);
+			r->v = sm_in_use(info->buffer);
 			acs_store_record(ME_A_ r);
 		}
 	}
@@ -260,57 +260,16 @@ static void do_acceptor_msg(ME_P_ struct msg_info *info)
 	sm_free(info->msg);
 }
 
-static void acc_informer_fiber(struct fbr_context *fiber_context, void *_arg)
-{
-	struct me_context *mctx;
-	fbr_id_t learner;
-	struct lea_fiber_arg lea_arg;
-	struct fbr_buffer lea_fb;
-	struct lea_instance_info instance_info, *ptr;
-	const size_t lii_size = sizeof(struct lea_instance_info);
-	size_t count, i;
-	uint64_t last_iid = 0;
-
-	mctx = container_of(fiber_context, struct me_context, fbr);
-
-	fbr_buffer_init(&mctx->fbr, &lea_fb, 0);
-
-	lea_arg.buffer = &lea_fb;
-	lea_arg.starting_iid = acs_get_highest_finalized(ME_A) + 1;
-	learner = fbr_create(&mctx->fbr, "acceptor/learner", lea_fiber,
-			&lea_arg, 0);
-	fbr_transfer(&mctx->fbr, learner);
-	fbr_log_d(&mctx->fbr, "acceptor informer started");
-loop:
-	while (fbr_buffer_wait_read(&mctx->fbr, &lea_fb, lii_size)) {
-		count = fbr_buffer_bytes(&mctx->fbr, &lea_fb) / lii_size;
-		fbr_log_d(&mctx->fbr, "reading %ld messages from fb", count);
-		fbr_mutex_lock(&mctx->fbr, &mctx->pxs.acc.acs.batch_mutex);
-		for (i = 0; i < count; i++) {
-			ptr = fbr_buffer_read_address(&mctx->fbr,
-					&lea_fb, lii_size);
-			memcpy(&instance_info, ptr, lii_size);
-			fbr_buffer_read_advance(&mctx->fbr, &lea_fb);
-			do_delivered_value(ME_A_ instance_info.iid,
-					instance_info.buffer);
-			sm_free(instance_info.buffer);
-			last_iid = instance_info.iid;
-		}
-		acs_set_highest_finalized(ME_A_ last_iid);
-		fbr_mutex_unlock(&mctx->fbr, &mctx->pxs.acc.acs.batch_mutex);
-	}
-	goto loop;
-}
-
 void acc_fiber(struct fbr_context *fiber_context, void *_arg)
 {
 	struct me_context *mctx;
 	fbr_id_t repeater;
-	fbr_id_t informer;
+	fbr_id_t learner;
 	struct fbr_buffer fb;
-	struct msg_info info, *ptr;
-	const size_t msg_size = sizeof(struct msg_info);
+	struct acc_msg msg, *ptr;
+	const size_t msg_size = sizeof(struct acc_msg);
 	size_t count, i;
+	uint64_t last_iid = 0;
 
 	mctx = container_of(fiber_context, struct me_context, fbr);
 
@@ -321,9 +280,9 @@ void acc_fiber(struct fbr_context *fiber_context, void *_arg)
 			NULL, 0);
 	fbr_transfer(&mctx->fbr, repeater);
 
-	informer = fbr_create(&mctx->fbr, "acceptor/informer",
-			acc_informer_fiber, NULL, 0);
-	fbr_transfer(&mctx->fbr, informer);
+	learner = fbr_create(&mctx->fbr, "acceptor/learner", lea_fiber,
+			&fb, 0);
+	fbr_transfer(&mctx->fbr, learner);
 
 	fbr_log_d(&mctx->fbr, "acceptor started");
 	fbr_set_noreclaim(&mctx->fbr, fbr_self(&mctx->fbr));
@@ -336,10 +295,24 @@ loop:
 		for (i = 0; i < count; i++) {
 			ptr = fbr_buffer_read_address(&mctx->fbr, &fb,
 					msg_size);
-			memcpy(&info, ptr, msg_size);
+			printf("read acc_msg %p\n", ptr);
+			memcpy(&msg, ptr, msg_size);
 			fbr_buffer_read_advance(&mctx->fbr, &fb);
-			do_acceptor_msg(ME_A_ &info);
+			switch (msg.type) {
+			case ACC_MT_MSG_INFO:
+				printf("ACC_MT_MSG_INFO\n");
+				do_acceptor_msg(ME_A_ &msg.msg_info);
+				break;
+			case ACC_MT_LEA_INSTANCE:
+				printf("ACC_MT_LEA_INSTANCE\n");
+				do_delivered_value(ME_A_
+						&msg.lea_instance_info);
+				last_iid = msg.lea_instance_info.iid;
+				break;
+			}
 		}
+		if (last_iid)
+			acs_set_highest_finalized(ME_A_ last_iid);
 		acs_batch_finish(ME_A);
 		fbr_mutex_unlock(&mctx->fbr, &mctx->pxs.acc.acs.batch_mutex);
 		acs_vacuum(ME_A);
@@ -349,6 +322,6 @@ loop:
 
 	acs_destroy(ME_A);
 	fbr_reclaim(&mctx->fbr, repeater);
-	fbr_reclaim(&mctx->fbr, informer);
+	fbr_reclaim(&mctx->fbr, learner);
 	fbr_set_reclaim(&mctx->fbr, fbr_self(&mctx->fbr));
 }

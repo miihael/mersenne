@@ -26,11 +26,26 @@
 
 #include <evfibers/fiber.h>
 #include <mersenne/acc_storage.h>
+#include <mersenne/learner.h>
+#include <mersenne/message.h>
 #include <mersenne/context_fwd.h>
 #include <mersenne/buffer.h>
 
 struct me_peer;
 struct me_message;
+
+enum ACC_MSG_TYPE {
+	ACC_MT_MSG_INFO = 1,
+	ACC_MT_LEA_INSTANCE = 2,
+};
+
+struct acc_msg {
+	enum ACC_MSG_TYPE type;
+	union {
+		struct msg_info msg_info;
+		struct lea_instance_info lea_instance_info;
+	};
+};
 
 struct acc_context {
 	struct acs_context acs;
