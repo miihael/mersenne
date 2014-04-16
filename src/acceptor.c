@@ -283,9 +283,9 @@ static void acc_informer_fiber(struct fbr_context *fiber_context, void *_arg)
 	fbr_log_d(&mctx->fbr, "acceptor informer started");
 loop:
 	while (fbr_buffer_wait_read(&mctx->fbr, &lea_fb, lii_size)) {
-		acs_batch_start(ME_A);
 		count = fbr_buffer_bytes(&mctx->fbr, &lea_fb) / lii_size;
 		fbr_log_d(&mctx->fbr, "reading %ld messages from fb", count);
+		fbr_mutex_lock(&mctx->fbr, &mctx->pxs.acc.acs.batch_mutex);
 		for (i = 0; i < count; i++) {
 			ptr = fbr_buffer_read_address(&mctx->fbr,
 					&lea_fb, lii_size);
@@ -297,8 +297,7 @@ loop:
 			last_iid = instance_info.iid;
 		}
 		acs_set_highest_finalized(ME_A_ last_iid);
-		acs_batch_finish(ME_A);
-		acs_vacuum(ME_A);
+		fbr_mutex_unlock(&mctx->fbr, &mctx->pxs.acc.acs.batch_mutex);
 	}
 	goto loop;
 }
@@ -331,9 +330,9 @@ void acc_fiber(struct fbr_context *fiber_context, void *_arg)
 loop:
 	while (fbr_buffer_wait_read(&mctx->fbr, &fb, msg_size)) {
 		fbr_log_d(&mctx->fbr, "can read something");
-		acs_batch_start(ME_A);
 		count = fbr_buffer_bytes(&mctx->fbr, &fb) / msg_size;
 		fbr_log_d(&mctx->fbr, "reading %ld messages from fb", count);
+		fbr_mutex_lock(&mctx->fbr, &mctx->pxs.acc.acs.batch_mutex);
 		for (i = 0; i < count; i++) {
 			ptr = fbr_buffer_read_address(&mctx->fbr, &fb,
 					msg_size);
@@ -342,6 +341,8 @@ loop:
 			do_acceptor_msg(ME_A_ &info);
 		}
 		acs_batch_finish(ME_A);
+		fbr_mutex_unlock(&mctx->fbr, &mctx->pxs.acc.acs.batch_mutex);
+		acs_vacuum(ME_A);
 	}
 	if (!fbr_want_reclaim(&mctx->fbr, fbr_self(&mctx->fbr)))
 		goto loop;
